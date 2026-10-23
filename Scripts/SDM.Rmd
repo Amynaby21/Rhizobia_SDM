@@ -1,0 +1,2021 @@
+---
+title: "Rhizobia SDM metasynthesis"
+subtitle: "SDM, climate change projections"
+author: "Ndeye Aminata Sall"
+date: "r Sys.Date()"
+---
+#Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(terra)
+library(sf)
+library(ape)
+library(biomod2)
+library(tidyverse)
+library(bipartite)
+library(ggplot2)
+library(ggspatial)
+library(scales)
+library(geodata)
+library(ecospat)
+
+sf::sf_use_s2(FALSE)
+terraOptions(memfrac = 0.4)
+
+# ── Directory structure ───────────────────────────────────────────────────────
+dirs <- c(
+  "data/raw", "data/processed",
+  "data/env_layers", "data/future",
+  "outputs/figures", "outputs/tables",
+  "outputs/models"
+)
+purrr::walk(dirs, dir.create,
+             showWarnings = FALSE,
+             recursive    = TRUE)
+```
+
+#Data loading and pre-processing
+
+```{r}
+# Load raw data
+metadata_raw <- read.csv("data/raw/metadata.csv", stringsAsFactors = FALSE)
+# Find true duplicates: same location + same soil
+soil_cols <- names(metadata_raw)[
+  names(metadata_raw) %in% c(
+    "Soil_pH", "pH", "Soil_clay", "clay",
+    "Soil_N", "T_N", "Soil_CEC", "CEC",
+    "Soil_OC", "SOC.g.kg.", "T_Car"
+  )
+]
+# Identify duplicates: same coordinates + same soil properties + same cluster
+dup_check <- metadata_raw |>
+  dplyr::mutate(
+    # Round coordinates to 4 decimal places
+    Lon_r = round(as.numeric(Longitude), 4),
+    Lat_r = round(as.numeric(Latitude),  4)
+  ) |>
+  dplyr::group_by(
+    Lon_r, Lat_r,
+    Groups,
+    dplyr::across(
+      dplyr::any_of(soil_cols)
+    )
+  ) |>
+  dplyr::mutate(
+    n_dup    = dplyr::n(),
+    dup_rank = dplyr::row_number()
+  ) |>
+  dplyr::ungroup()
+
+cat("Groups with duplicates:\n")
+dup_check |>
+  dplyr::filter(n_dup > 1) |>
+  dplyr::select(SampleID, Longitude, Latitude,
+                Groups, n_dup,
+                dplyr::any_of(soil_cols)) |>
+  dplyr::arrange(Long, Lat) |>
+  as.data.frame() |>
+  print()
+# Remove true duplicates
+metadata_dedup <- dup_check |>
+  dplyr::filter(dup_rank == 1) |>
+  dplyr::select(-Lon_r, -Lat_r,
+                -n_dup, -dup_rank) |>
+    ObsID = paste0("OBS_",
+                    stringr::str_pad(
+                      dplyr::row_number(),
+                      width = 3, pad = "0"
+                    ))
+print(table(metadata_dedup$Groups))
+print(table(metadata_dedup$Country))
+saveRDS(metadata_dedup, "data/processed/metadata_dedup.rds")
+
+```
+
+#Bioclimatic and soil variables
+
+```{r}
+#Nine-country mask
+country_lookup <- c(
+  "Ang"="Angola", "Esw"="Kingdom of eSwatini", "Eth"="Ethiopia", "Gha"="Ghana",
+  "Ken"="Kenya", "Moz"="Mozambique", "Nam"="Namibia", "SA"="South Africa",
+  "Sen"="Senegal")
+africa_full <- rnaturalearth::ne_countries(
+  continent = "africa", returnclass = "sf", scale = "medium") |> sf::st_make_valid()
+sampled_mask_sf <- africa_full |>
+  filter(name_long %in% country_lookup | name %in% country_lookup)
+stopifnot("Expected 9 sampled countries" = nrow(sampled_mask_sf) == 9)
+saveRDS(sampled_mask_sf, "data/processed/sampled_mask_sf.rds")
+ssa_ext <- terra::ext(-25, 52, -35, 20)
+
+bio_current <- geodata::worldclim_global(
+  var="bio", res=2.5, path="data/env_layers"
+)
+bio_ssa <- terra::crop(bio_current, ssa_ext)
+
+bio_names <- c(
+  "BIO1_AnnMeanTemp",  "BIO2_DiurnalRange",
+  "BIO3_Isothermality","BIO4_TempSeason",
+  "BIO5_MaxTWarmM",    "BIO6_MinTColdM",
+  "BIO7_TempAnnRange", "BIO8_MeanTWetQ",
+  "BIO9_MeanTDryQ",    "BIO10_MeanTWarmQ",
+  "BIO11_MeanTColdQ",  "BIO12_AnnPrec",
+  "BIO13_PrecWetM",    "BIO14_PrecDryM",
+  "BIO15_PrecSeason",  "BIO16_PrecWetQ",
+  "BIO17_PrecDryQ",    "BIO18_PrecWarmQ",
+  "BIO19_PrecColdQ"
+)
+names(bio_ssa) <- bio_names
+#SoilGrids 0-30cm weighted mean
+soil_path  <- "data/env_layers/soil_world"
+soil_vars  <- c("phh2o","soc","nitrogen",
+                "clay","cec")
+soil_names <- c("Soil_pH","Soil_SOC","Soil_N",
+                "Soil_clay","Soil_CEC")
+weights    <- c(5,10,15)/30
+
+soil_stack_final <- list()
+for (i in seq_along(soil_vars)) {
+  v <- soil_vars[i]
+  files <- sort(list.files(
+    soil_path, pattern=paste0("^",v),
+    full.names=TRUE))
+  l1 <- terra::crop(terra::rast(files[1]), ssa_ext)
+  l2 <- terra::crop(terra::rast(files[2]), ssa_ext)
+  l3 <- terra::crop(terra::rast(files[3]), ssa_ext)
+  if (!all(dim(l1)[1:2]==dim(l3)[1:2]))
+    l3 <- terra::resample(l3, l1, method="bilinear")
+  wmean <- weights[1]*l1 + weights[2]*l2 +
+           weights[3]*l3
+  names(wmean) <- soil_names[i]
+  soil_stack_final[[v]] <- wmean
+}
+soil_stack <- terra::rast(soil_stack_final)
+
+# Resample soil to match bio
+soil_stack <- terra::resample(
+  soil_stack, bio_ssa[[1]], method="bilinear"
+)
+names(soil_stack) <- soil_names
+saveRDS(soil_stack, "data/processed/soil_stack_0_30cm_wmean.rds")
+```
+
+#Geo-referencing
+
+```{r}
+SSA_EXT  <- ext(-25, 52, -35, 20)             
+THR_FRAC <- 0.05                              # cell is cropland if >= 5% cropland
+CAP_KM   <- 25                                # maximum snap distance (km)
+wc_path  <- "data/env_layers/climate/wc2.1_2.5m/wc2.1_2.5m_bio_1.tif"
+crop_dir <- "data/env_layers/cropland_check"
+crop_tif <- file.path(crop_dir, "landuse/landuse/WorldCover_cropland_30s.tif")
+
+# Cropland domain
+bio1 <- crop(rast(wc_path), SSA_EXT)
+
+if (!file.exists(crop_tif)) {               
+  dir.create(crop_dir, showWarnings = FALSE, recursive = TRUE)
+  geodata::cropland(source = "WorldCover", path = crop_dir)
+}
+cl <- crop(rast(crop_tif), SSA_EXT)
+if (as.numeric(global(cl, "max", na.rm = TRUE)[1, 1]) > 1.5) cl <- cl / 100  # -> 0-1
+
+clg  <- aggregate(cl, fact = 5, fun = "mean", na.rm = TRUE)   
+clg  <- resample(clg, bio1, method = "bilinear")
+agri <- ifel(clg >= THR_FRAC & !is.na(bio1), 1, NA)           
+
+# Classify occurrences; snap those off the domain
+md <- as.data.frame(readRDS("data/processed/metadata_dedup.rds"))
+md$Longitude <- as.numeric(md$Longitude)
+md$Latitude  <- as.numeric(md$Latitude)
+
+pts     <- vect(as.matrix(md[, c("Longitude", "Latitude")]), crs = "EPSG:4326")
+on_mask <- !is.na(terra::extract(agri, pts)[, 2])
+
+md$Longitude_orig        <- md$Longitude
+md$Latitude_orig         <- md$Latitude
+md$georef_uncertainty_km <- 0
+md$coord_status          <- "on_mask"
+
+off <- which(!on_mask)
+if (length(off) > 0) {
+  nr  <- as.data.frame(nearest(pts[off], as.points(agri)))  
+  dkm <- nr$distance / 1000
+  ok  <- dkm <= CAP_KM
+
+  md$Longitude[off[ok]] <- nr$to_x[ok]
+  md$Latitude[off[ok]]  <- nr$to_y[ok]
+  md$georef_uncertainty_km[off] <- round(dkm, 1)
+  md$coord_status[off[ok]]  <- "snapped"
+  md$coord_status[off[!ok]] <- "review"
+}
+
+# Records beyond the 25 km cap correction
+review   <- md$coord_status == "review"
+keep_idx <- which(review & md$Country == "Ken")   # source-paper GPS: keep as is
+drop_idx <- which(review & md$Country == "Sen")   # locality names only: drop
+
+if (length(keep_idx) > 0) {
+  md$Longitude[keep_idx] <- md$Longitude_orig[keep_idx]
+  md$Latitude[keep_idx]  <- md$Latitude_orig[keep_idx]
+  md$georef_uncertainty_km[keep_idx] <- 0
+  md$coord_status[keep_idx] <- "kept_paper_coords"
+  agri[cellFromXY(agri, as.matrix(md[keep_idx, c("Longitude", "Latitude")]))] <- 1
+}
+
+md_final <- if (length(drop_idx) > 0) md[-drop_idx, ] else md
+
+saveRDS(md_final, "data/processed/metadata_coordfixed.rds")
+writeRaster(agri, "data/processed/agricultural_mask_worldcover.tif", overwrite = TRUE)
+```
+
+#Input preparation
+
+```{r}
+metadata   <- readRDS("data/processed/metadata_coordfixed.rds")
+# Modelled clusters(n >= 10)
+sdm_groups <- c(
+  "Rhizobium_cluster", "Bradyrhizobium_novel", "B. elkanii_cluster",
+  "B. japonicum_cluster", "Bradyrhizobium_cluster", "R. phaseoli_cluster",
+  "R. leguminosarum_cluster", "M. tropici_cluster", "R. radiobacter_cluster")
+print(metadata |> filter(Groups %in% sdm_groups) |> count(Groups) |> arrange(desc(n)))
+cat("Excluded lineages (n < 10):\n")
+print(metadata |> filter(!Groups %in% sdm_groups) |> count(Groups))
+cat("Total for SDM:", sum(metadata$Groups %in% sdm_groups),
+    "of", nrow(metadata), "\n")
+saveRDS(sdm_groups,  "data/processed/sdm_groups.rds")
+saveRDS(metadata, "data/processed/metadata.rds")
+```
+
+#Multicollinearity using VIF
+
+```{r}
+sf::sf_use_s2(FALSE)
+ssa_ext <- terra::ext(-25,52,-35,20)
+pts <- terra::vect(
+  as.matrix(metadata[,
+    c("Longitude","Latitude")]),
+  crs="EPSG:4326")
+
+# Extract all 19 BIO
+cat("Loading all 19 WorldClim BIO...\n")
+bio_full <- geodata::worldclim_global(
+  var="bio", res=2.5,
+  path="data/env_layers")
+bio_ssa <- terra::crop(bio_full, ssa_ext)
+
+bio_names_all <- c(
+  "BIO1_AnnMeanTemp","BIO2_DiurnalRange",
+  "BIO3_Isothermality","BIO4_TempSeason",
+  "BIO5_MaxTWarmM","BIO6_MinTColdM",
+  "BIO7_TempAnnRange","BIO8_MeanTWetQ",
+  "BIO9_MeanTDryQ","BIO10_MeanTWarmQ",
+  "BIO11_MeanTColdQ","BIO12_AnnPrec",
+  "BIO13_PrecWetM","BIO14_PrecDryM",
+  "BIO15_PrecSeason","BIO16_PrecWetQ",
+  "BIO17_PrecDryQ","BIO18_PrecWarmQ",
+  "BIO19_PrecColdQ")
+names(bio_ssa) <- bio_names_all
+
+bio_vals <- terra::extract(
+  bio_ssa, pts,
+  method="bilinear")[,-1]
+
+# Fill any NA with nearest
+na_b <- which(rowSums(is.na(bio_vals))>0)
+if(length(na_b)>0){
+  cat("Filling",length(na_b),"BIO NAs...\n")
+  for(i in na_b){
+    for(bk in c(10,25,50,100)){
+      buf <- terra::buffer(
+        pts[i], width=bk*1000)
+      v <- terra::extract(bio_ssa, buf,
+        fun=function(x) mean(x,na.rm=TRUE))[,-1]
+      if(!any(is.na(as.numeric(v)))){
+        bio_vals[i,] <- v; break}
+    }
+  }
+}
+cat("BIO NAs remaining:",
+    sum(is.na(bio_vals)),"\n")
+
+# Extract all soil variables
+cat("\nLoading soil stack...\n")
+soil_stack <- readRDS("data/processed/soil_stack_0_30cm_wmean.rds")
+soil_names <- c("Soil_pH","Soil_SOC","Soil_N", "Soil_clay","Soil_CEC")
+names(soil_stack) <- soil_names
+
+soil_vals <- terra::extract(
+  soil_stack, pts,
+  method="bilinear")[,-1]
+
+na_s <- which(rowSums(is.na(soil_vals))>0)
+if(length(na_s)>0){
+  cat("Filling",length(na_s),"soil NAs...\n")
+  for(i in na_s){
+    for(bk in c(10,25,50,100,200)){
+      buf <- terra::buffer(
+        pts[i], width=bk*1000)
+      v <- terra::extract(soil_stack, buf,
+        fun=function(x) mean(x,na.rm=TRUE))[,-1]
+      if(!any(is.na(as.numeric(v)))){
+        soil_vals[i,] <- v; break}
+    }
+  }
+}
+cat("Soil NAs remaining:",
+    sum(is.na(soil_vals)),"\n")
+
+# Stepwise VIF function
+vif_step <- function(df, thresh=10){
+  vars <- names(df)
+  dropped <- c()
+  repeat{
+    if(length(vars)<2) break
+    vifs <- sapply(vars, function(v){
+      others <- setdiff(vars, v)
+      r2 <- summary(lm(
+        as.formula(paste(v,"~",
+          paste(others,collapse="+"))),
+        data=df[,vars]))$r.squared
+      1/(1-r2)
+    })
+    if(max(vifs) < thresh) break
+    drop <- names(which.max(vifs))
+    cat("  Drop:", drop,
+        "(VIF=",round(max(vifs),1),")\n")
+    dropped <- c(dropped, drop)
+    vars <- setdiff(vars, drop)
+  }
+  list(kept=vars, dropped=dropped,
+       final_vif=round(sort(vifs,
+         decreasing=TRUE),2))
+}
+
+# Screen CLIMATE alone
+cat("\n=== CLIMATE VIF screening (19 BIO) ===\n")
+bio_df <- as.data.frame(bio_vals) |>
+  na.omit()
+clim_res <- vif_step(bio_df, thresh=10)
+cat("\nClimate kept (",
+    length(clim_res$kept),"):\n")
+print(clim_res$kept)
+cat("\nClimate final VIF:\n")
+print(clim_res$final_vif)
+
+#Screen SOIL alone
+cat("\n=== SOIL VIF screening (5 soil) ===\n")
+soil_df <- as.data.frame(soil_vals) |>
+  na.omit()
+soil_res <- vif_step(soil_df, thresh=10)
+cat("\nSoil kept (",
+    length(soil_res$kept),"):\n")
+print(soil_res$kept)
+cat("\nSoil final VIF:\n")
+print(soil_res$final_vif)
+
+# Combine & final joint screen
+cat("\n=== COMBINED screening ===\n")
+combined_vars <- c(
+  clim_res$kept, soil_res$kept)
+combined_df <- cbind(
+  bio_df[,clim_res$kept,drop=FALSE],
+  soil_df[,soil_res$kept,drop=FALSE]) |>
+  na.omit()
+final_res <- vif_step(
+  combined_df, thresh=10)
+
+print(final_res$kept)
+print(final_res$final_vif)
+
+# ── Save everything
+selected_vars <- final_res$kept
+saveRDS(selected_vars, "data/processed/selected_vars.rds")
+
+# Save full extracted values for later
+all_env <- data.frame(
+  ObsID = metadata$ObsID,
+  bio_vals, soil_vals)
+saveRDS(all_env,"data/processed/all_env_extracted.rds")
+
+# VIF table
+vif_final_table <- data.frame(
+  Variable = names(final_res$final_vif),
+  VIF = as.numeric(final_res$final_vif),
+  Block = ifelse(
+    grepl("BIO", names(final_res$final_vif)),
+    "Climate","Soil"),
+  Retained = "Yes")
+write.csv(vif_final_table,"outputs/tables/Table_VIF.csv",
+  row.names=FALSE)
+
+#REBUILD ENV STACK with the 12 selected vars (FULL RES)
+terraOptions(
+  memfrac=0.5,
+  tempdir="data/processed/_terratmp")
+dir.create("data/processed/_terratmp",
+  showWarnings=FALSE, recursive=TRUE)
+
+# bio_ssa (19 WorldClim layers cropped to SSA, named BIO1..BIO19) and soil_stack come from part 1.
+# Soil resampled to the WorldClim grid:
+soil_ras <- terra::resample(
+  soil_stack, bio_ssa[[1]],
+  method="bilinear")
+names(soil_ras) <- c(
+  "Soil_pH","Soil_SOC","Soil_N",
+  "Soil_clay","Soil_CEC")
+
+bio_sel  <- selected_vars[
+  grepl("BIO", selected_vars)]
+soil_sel <- selected_vars[
+  grepl("Soil", selected_vars)]
+
+# Build full-res stack
+env_rast <- c(
+  bio_ssa[[bio_sel]],
+  soil_ras[[soil_sel]])
+env_rast <- env_rast[[selected_vars]]
+cat("\nStack layers:",
+    terra::nlyr(env_rast),"\n")
+print(names(env_rast))
+
+# Apply WorldCover mask (full res)
+agri_wc <- terra::rast(
+  "data/processed/agricultural_mask_worldcover.tif")
+agri_wc <- terra::resample(
+  agri_wc, env_rast[[1]], method="near")
+
+env_rast_masked <- terra::mask(
+  env_rast, agri_wc)
+
+terra::writeRaster(
+  env_rast_masked, "data/processed/env_rast_masked.tif",
+  overwrite=TRUE)
+cat("\nFull-res masked stack saved\n")
+print(env_rast_masked)
+
+# EXTRACT ENV VALUES AT CORRECTED COORDINATES
+
+pts <- terra::vect(
+  as.matrix(metadata[,
+    c("Longitude","Latitude")]),
+  crs="EPSG:4326")
+
+# Extract from masked stack
+env_vals <- terra::extract(
+  env_rast_masked, pts,
+  method="bilinear")[,-1]
+
+cat("Extraction from masked stack:\n")
+cat("NA rows:",
+    sum(rowSums(is.na(env_vals))>0),
+    "\n")
+
+#Fix any remaining NAs with unmasked
+na_rows <- which(
+  rowSums(is.na(env_vals))>0)
+
+if (length(na_rows)>0) {
+  cat("Fixing", length(na_rows),
+      "NA rows with unmasked stack...\n")
+
+  env_rast_unmasked <- terra::aggregate(
+    env_rast, fact=2, method="bilinear")
+
+  unmasked_fix <- terra::extract(
+    env_rast_unmasked,
+    pts[na_rows],
+    method="bilinear")[,-1]
+
+  env_vals[na_rows,] <- unmasked_fix
+
+  still_na <- which(
+    rowSums(is.na(env_vals))>0)
+  cat("Still NA after unmasked fix:",
+      length(still_na),"\n")
+
+  if (length(still_na)>0) {
+    print(metadata[still_na,] |>
+      dplyr::select(
+        ObsID,Country,
+        Longitude,Latitude))
+  }
+}
+
+env_df <- metadata |>
+  dplyr::select(
+    ObsID, Study, Country,
+    Plant_host, Longitude,
+    Latitude, Groups
+  ) |>
+  dplyr::bind_cols(
+    as.data.frame(env_vals)
+)
+
+print(names(env_df))
+print(summary(env_df[, selected_vars]))
+
+saveRDS(env_df, "data/processed/env_df.rds")
+
+# VIF check with corrected data
+cat("\n=== VIF check ===\n")
+vif_check <- car::vif(lm(
+  BIO1_AnnMeanTemp ~ .,
+  data=env_df |>
+    dplyr::select(
+      dplyr::all_of(selected_vars)) |>
+    na.omit()))
+print(round(sort(vif_check,
+                  decreasing=TRUE),2))
+cat("Max VIF:", round(max(vif_check),2),"\n")
+```
+
+#Predictors table
+
+```{r}
+descriptions <- c(
+  BIO2_DiurnalRange="Mean diurnal temperature range",
+  BIO4_TempSeason="Temperature seasonality",
+  BIO8_MeanTWetQ="Mean temp. of wettest quarter",
+  BIO14_PrecDryM="Precipitation of driest month",
+  BIO15_PrecSeason="Precipitation seasonality",
+  BIO16_PrecWetQ="Precipitation of wettest quarter",
+  BIO18_PrecWarmQ="Precipitation of warmest quarter",
+  BIO19_PrecColdQ="Precipitation of coldest quarter",
+  Soil_pH="Soil pH (H2O)", Soil_N="Total nitrogen",
+  Soil_clay="Clay content",
+  Soil_CEC="Cation exchange capacity")
+units_vec <- c(
+  BIO2_DiurnalRange="deg C",BIO4_TempSeason="deg Cx100",
+  BIO8_MeanTWetQ="deg C",BIO14_PrecDryM="mm",
+  BIO15_PrecSeason="CV",BIO16_PrecWetQ="mm",
+  BIO18_PrecWarmQ="mm",BIO19_PrecColdQ="mm",
+  Soil_pH="-",Soil_N="g/kg",Soil_clay="%",
+  Soil_CEC="cmol/kg")
+pred_table <- purrr::map_dfr(selected_vars, function(v){
+  x <- env_df[[v]]; x <- x[!is.na(x)]
+  data.frame(Variable=v, Description=descriptions[v],
+    Unit=units_vec[v],
+    Type=ifelse(grepl("BIO",v),
+      "Climate (WorldClim v2.1)",
+      "Soil (SoilGrids v2.0)"),
+    N=length(x), Mean=round(mean(x),2),
+    SD=round(sd(x),2), Min=round(min(x),2),
+    Max=round(max(x),2))
+})
+write.csv(pred_table,"outputs/tables/Table_predictors.csv",row.names=FALSE)
+print(as.data.frame(pred_table[,
+  c("Variable","Mean","SD","Min","Max")]))
+```
+
+#Map with sampling points
+
+```{r}
+library(terra); library(sf)
+library(ggplot2); library(tidyverse)
+library(ggnewscale)
+sf::sf_use_s2(FALSE)
+
+africa_outline <- rnaturalearth::ne_countries(
+  continent = "africa", returnclass = "sf", scale = "medium") |>
+  sf::st_make_valid() |> sf::st_union() |> sf::st_make_valid()
+
+# ── cropland = non-NA footprint of the masked stack ──
+env       <- terra::rast("data/processed/env_rast_masked.tif")[[1]]
+crop_mask <- terra::ifel(!is.na(env), 1, NA)
+crop_mask <- terra::mask(crop_mask,
+                         terra::vect(sampled_mask_sf |> sf::st_make_valid() |>
+                                       sf::st_union() |> sf::st_make_valid()))
+cdf <- as.data.frame(crop_mask, xy = TRUE, na.rm = TRUE)
+names(cdf)[3] <- "v"
+cdf$lab <- "Cropland"
+cat("Cropland cells:", nrow(cdf), "\n")
+
+# ── occurrence points ────────────────────────────────
+pts <- metadata |>
+  dplyr::filter(!is.na(Longitude), !is.na(Latitude), !is.na(Plant_host)) |>
+  dplyr::add_count(Plant_host, name = "n_host") |>
+  dplyr::arrange(dplyr::desc(n_host))   
+
+host_cols <- c("Ar_hy" = "#0072B2",     
+               "Gl_ma" = "red",     
+               "Ph_vu" = "yellow",     
+               "Vi_un" = "purple")     
+
+host_shapes <- c("Ar_hy" = 21,          
+                 "Gl_ma" = 22,          
+                 "Ph_vu" = 23,          
+                 "Vi_un" = 24)          
+
+host_labs <- c("Ar_hy" = "Ar_hy",
+               "Gl_ma" = "Gl_max",
+               "Ph_vu" = "Ph_vu",
+               "Vi_un" = "Vi_ung")
+
+p <- ggplot2::ggplot() +
+  ggplot2::geom_sf(data = africa_outline,
+                   fill = "#EFEFEF", colour = "grey45", linewidth = 0.3) +
+  ggplot2::geom_sf(data = sampled_mask_sf,
+                   fill = "#DCE9F5", colour = NA) +
+  # CROPLAND in green
+  ggplot2::geom_raster(data = cdf, ggplot2::aes(x, y, fill = lab)) +
+  ggplot2::scale_fill_manual(
+    values = c("Cropland" = "#6B9A4E"), name = NULL,
+    guide  = ggplot2::guide_legend(order = 2, override.aes = list(size = 4))) +
+  ggplot2::geom_sf(data = sampled_mask_sf,
+                   fill = NA, colour = "black", linewidth = 0.4) +
+  # ── reset fill so points get their own fill scale ──
+  ggnewscale::new_scale_fill() +
+  ggplot2::geom_point(data = pts,
+                      ggplot2::aes(Longitude, Latitude,
+                                   fill = Plant_host, shape = Plant_host),
+                      colour = "grey15", size = 2.3, stroke = 0.3, alpha = 0.85,
+                      position = ggplot2::position_jitter(
+                        width = 0.06, height = 0.06, seed = 42)) +
+  ggplot2::scale_fill_manual(values = host_cols, labels = host_labs,
+                             name = "Plant host") +
+  ggplot2::scale_shape_manual(values = host_shapes, labels = host_labs,
+                              name = "Plant host") +
+  ggplot2::guides(
+    fill  = ggplot2::guide_legend(order = 1,
+                                  override.aes = list(size = 3.6, alpha = 1, shape = host_shapes)),
+    shape = ggplot2::guide_legend(order = 1,
+                                  override.aes = list(size = 3.6, alpha = 1, fill = host_cols))) +
+  ggplot2::coord_sf(xlim = c(-20, 52), ylim = c(-35, 38), expand = FALSE) +
+  ggplot2::labs(x = NULL, y = NULL) +
+  ggplot2::theme_bw(base_size = 12) +
+  ggplot2::theme(
+    panel.grid       = ggplot2::element_blank(),
+    panel.background = ggplot2::element_rect(fill = "white"),
+    panel.border     = ggplot2::element_rect(colour = "black", fill = NA,
+                                             linewidth = 1),
+    axis.text        = ggplot2::element_text(size = 15, colour = "black"),
+    legend.title     = ggplot2::element_text(size = 15, face = "bold"),
+    legend.text      = ggplot2::element_text(size = 13),
+    legend.key       = ggplot2::element_blank(),
+    plot.background  = ggplot2::element_rect(fill = "white", colour = NA)) +
+  ggspatial::annotation_scale(location = "bl", width_hint = 0.28,
+                              text_cex = 0.6,
+                              bar_cols = c("black", "white")) +
+  ggspatial::annotation_north_arrow(location = "tr", which_north = "true",
+                                    height = ggplot2::unit(0.9, "cm"),
+                                    width  = ggplot2::unit(0.7, "cm"),
+                                    style  = ggspatial::north_arrow_fancy_orienteering())
+```
+
+#FUTURE STACKS: 3-GCM ENSEMBLE MEAN (ACCESS-CM2, MPI-ESM1-2-HR, IPSL-CM6A-LR)
+
+```{r}
+terraOptions(
+  memfrac=0.5,
+  tempdir="data/processed/_terratmp")
+options(timeout=3600)
+
+ssa_ext <- terra::ext(-25,52,-35,20)
+selected_vars <- readRDS("data/processed/selected_vars.rds")
+env_rast_masked <- terra::rast("data/processed/env_rast_masked.tif")
+ref_grid <- env_rast_masked[[1]]
+agri_wc <- terra::rast("data/processed/agricultural_mask_worldcover.tif")
+agri_wc <- terra::resample(
+  agri_wc, ref_grid, method="near")
+
+bio_sel  <- selected_vars[
+  grepl("BIO", selected_vars)]
+soil_sel <- selected_vars[
+  grepl("Soil", selected_vars)]
+
+soil_stack <- readRDS(
+  "data/processed/soil_stack_0_30cm_wmean.rds")
+names(soil_stack) <- c(
+  "Soil_pH","Soil_SOC","Soil_N",
+  "Soil_clay","Soil_CEC")
+soil_res <- terra::resample(
+  soil_stack, ref_grid, method="bilinear")
+names(soil_res) <- c(
+  "Soil_pH","Soil_SOC","Soil_N",
+  "Soil_clay","Soil_CEC")
+soil_layer <- soil_res[[soil_sel]]
+
+bio_names_all <- c(
+  "BIO1_AnnMeanTemp","BIO2_DiurnalRange",
+  "BIO3_Isothermality","BIO4_TempSeason",
+  "BIO5_MaxTWarmM","BIO6_MinTColdM",
+  "BIO7_TempAnnRange","BIO8_MeanTWetQ",
+  "BIO9_MeanTDryQ","BIO10_MeanTWarmQ",
+  "BIO11_MeanTColdQ","BIO12_AnnPrec",
+  "BIO13_PrecWetM","BIO14_PrecDryM",
+  "BIO15_PrecSeason","BIO16_PrecWetQ",
+  "BIO17_PrecDryQ","BIO18_PrecWarmQ",
+  "BIO19_PrecColdQ")
+
+gcm_models <- c(
+  "ACCESS-CM2",
+  "MPI-ESM1-2-HR",
+  "IPSL-CM6A-LR")
+
+scen_map <- list(
+  SSP245_2050=list(ssp="245",time="2041-2060"),
+  SSP585_2050=list(ssp="585",time="2041-2060"),
+  SSP245_2070=list(ssp="245",time="2061-2080"),
+  SSP585_2070=list(ssp="585",time="2061-2080"))
+
+for (sc in names(scen_map)) {
+  cat("\n=== Building future:", sc, "===\n")
+  info <- scen_map[[sc]]
+  out_fp <- paste0(
+    "data/processed/future_",sc,".tif")
+  if (file.exists(out_fp)) {
+    cat("  Exists, skip\n"); next
+  }
+
+  # Download each GCM, collect bio_sel
+  gcm_stacks <- list()
+  for (gm in gcm_models) {
+    cat("  GCM:", gm, "...")
+    fb <- tryCatch(
+      geodata::cmip6_world(
+        model=gm, ssp=info$ssp,
+        time=info$time, var="bioc",
+        res=2.5,
+        path="data/env_layers"),
+      error=function(e){
+        cat("ERR:",e$message,"\n")
+        NULL})
+    if (is.null(fb)) next
+    fb <- terra::crop(fb, ssa_ext)
+    names(fb) <- bio_names_all
+    gcm_stacks[[gm]] <- fb[[bio_sel]]
+    cat("ok\n")
+  }
+
+  if (length(gcm_stacks)==0) {
+    cat("  No GCMs downloaded!\n"); next
+  }
+
+  # Average across GCMs, per variable
+  cat("  Averaging",
+      length(gcm_stacks),"GCMs...\n")
+  fut_bio_mean <- gcm_stacks[[1]]
+  if (length(gcm_stacks)>1) {
+    for (v in bio_sel) {
+      layers <- terra::rast(lapply(
+        gcm_stacks, function(s) s[[v]]))
+      fut_bio_mean[[v]] <- terra::app(
+        layers, mean, na.rm=TRUE)
+    }
+  }
+
+  fut_bio_mean <- terra::resample(
+    fut_bio_mean, ref_grid,
+    method="bilinear")
+
+  fut_stack <- c(fut_bio_mean, soil_layer)
+  fut_stack <- fut_stack[[selected_vars]]
+  fut_stack <- terra::mask(fut_stack, agri_wc)
+
+  terra::writeRaster(
+    fut_stack, out_fp, overwrite=TRUE)
+  cat("  Saved:", terra::nlyr(fut_stack),
+      "layers\n")
+  rm(gcm_stacks, fut_bio_mean, fut_stack)
+  gc()
+}
+```
+
+#Ensemble SDM
+
+```{r}
+out_dir <- file.path(getwd(),"outputs","biomod2")
+# Background points (within agri mask)
+cat("Building background...\n")
+agri_mask_for_bg <- terra::resample(
+  agri_wc, env_rast_masked[[1]],
+  method="near")
+
+sampled_union <- sampled_mask_sf |>
+  sf::st_union() |> sf::st_make_valid()
+agri_poly <- terra::as.polygons(
+  agri_mask_for_bg, dissolve=TRUE) |>
+  sf::st_as_sf() |> sf::st_make_valid() |>
+  sf::st_intersection(sampled_union) |>
+  sf::st_make_valid()
+
+set.seed(42)
+bg_pts <- terra::spatSample(
+  terra::vect(agri_poly),
+  size=10000, method="random")
+bg_env <- terra::extract(
+  env_rast_masked, bg_pts,
+  method="bilinear")[,-1]
+bg_coords <- terra::crds(bg_pts)
+keep <- rowSums(is.na(bg_env))==0
+bg_env <- bg_env[keep,]
+bg_coords <- bg_coords[keep,]
+saveRDS(list(env=bg_env,coords=bg_coords),"data/processed/background_final.rds")
+
+# Model each group
+sdm_results <- list()
+
+for (g in sdm_groups) {
+  g_clean <- gsub("[^A-Za-z0-9]","_",g)
+  cat("\n",strrep("=",45),"\n")
+  cat("MODELING:", g, "\n")
+  cat(strrep("=",45),"\n")
+
+  pres_g <- env_df |>
+    dplyr::filter(Groups==g)
+  n_pres <- nrow(pres_g)
+  cat("n presence:", n_pres,"\n")
+
+  pres_env <- pres_g |>
+    dplyr::select(
+      dplyr::all_of(selected_vars))
+  pres_coords <- pres_g |>
+    dplyr::select(Longitude, Latitude)
+
+  all_env <- rbind(pres_env, bg_env)
+  all_coords <- rbind(
+    pres_coords,
+    data.frame(
+      Longitude=bg_coords[,1],
+      Latitude =bg_coords[,2]))
+  resp_var <- c(
+    rep(1,n_pres), rep(0,nrow(bg_env)))
+
+  bm_data <- tryCatch(
+    biomod2::BIOMOD_FormatingData(
+      resp.var = resp_var,
+      expl.var = all_env,
+      resp.xy  = all_coords,
+      resp.name= g_clean,
+      dir.name = out_dir),
+    error=function(e){
+      cat("Format error:",e$message,"\n")
+      NULL})
+  if (is.null(bm_data)) next
+
+  bm_mod <- tryCatch(
+    biomod2::BIOMOD_Modeling(
+      bm.format   = bm_data,
+      modeling.id = g_clean,
+      models      = c("GLM","GBM",
+                       "RF","MAXNET"),
+      CV.strategy = "kfold",
+      CV.k        = 5,
+      CV.nb.rep   = 5,
+      CV.do.full.models = FALSE,
+      var.import  = 3,
+      metric.eval = c("TSS","AUCroc"),
+      seed.val    = 42),
+    error=function(e){
+      cat("Model error:",e$message,"\n")
+      NULL})
+  if (is.null(bm_mod)) next
+
+  eval_chk <- biomod2::get_evaluations(bm_mod)
+  cat("Algos:",
+      paste(unique(eval_chk$algo),
+            collapse=", "),"\n")
+
+  bm_ens <- tryCatch(
+    biomod2::BIOMOD_EnsembleModeling(
+      bm.mod        = bm_mod,
+      models.chosen = "all",
+      em.by         = "all",
+      metric.select = "TSS",
+      metric.select.thresh = 0.4,
+      metric.eval   = c("TSS","AUCroc"),
+      em.algo       = "EMmean",
+      var.import    = 3,
+      seed.val      = 42),
+    error=function(e){
+      cat("Ensemble error:",e$message,"\n")
+      NULL})
+  if (is.null(bm_ens)) next
+
+  # Project current at FULL resolution
+  cat("Projecting current...\n")
+  bm_proj <- tryCatch(
+    biomod2::BIOMOD_EnsembleForecasting(
+      bm.em       = bm_ens,
+      new.env     = env_rast_masked,
+      proj.name   = paste0(g_clean,"_current"),
+      models.chosen = "all",
+      on_0_1000   = TRUE),
+    error=function(e){
+      cat("Proj error:",e$message,"\n")
+      NULL})
+
+  sdm_results[[g]] <- list(
+    bm_mod = bm_mod,
+    bm_ens = bm_ens,
+    eval   = biomod2::get_evaluations(bm_mod),
+    vi     = biomod2::get_variables_importance(bm_mod))
+
+  saveRDS(sdm_results,"outputs/models/sdm_results_final_progress.rds")
+  cat("Saved progress:", g,"\n")
+  gc()
+}
+saveRDS(sdm_results,"outputs/models/sdm_results_final.rds")
+
+# Fallback for lineages that failed above (Windows long-path limit).
+# Original run: only R. leguminosarum_cluster. Uses a short directory and a short
+# response name; algorithms, folds, seeds and thresholds are identical.
+
+missing_groups <- setdiff(sdm_groups, names(sdm_results))
+short_names <- c("R. leguminosarum_cluster" = "Rleg", "M. tropici_cluster" = "Mtrop")
+short_dir   <- "C:/sdm_tmp"          
+dir.create(short_dir, showWarnings = FALSE, recursive = TRUE)
+
+for (g in missing_groups) {
+  sn <- if (g %in% names(short_names)) short_names[[g]] else
+    gsub("[^A-Za-z0-9]", "", g)
+  cat("Re-running with short path:", g, "as", sn, "\n")
+  # remove any half-written project folder left by the failed long-path attempt
+  unlink(file.path(out_dir, gsub("[^A-Za-z0-9\\.]", ".", gsub("[^A-Za-z0-9]", "_", g))),
+         recursive = TRUE, force = TRUE)
+  pres_g   <- env_df |> dplyr::filter(Groups == g)
+  pres_env <- pres_g |> dplyr::select(dplyr::all_of(selected_vars))
+  all_env    <- rbind(pres_env, bg_env)
+  all_coords <- rbind(pres_g |> dplyr::select(Longitude, Latitude),
+                      data.frame(Longitude = bg_coords[, 1], Latitude = bg_coords[, 2]))
+  resp_var   <- c(rep(1, nrow(pres_g)), rep(0, nrow(bg_env)))
+
+  bm_data <- biomod2::BIOMOD_FormatingData(
+    resp.var = resp_var, expl.var = all_env, resp.xy = all_coords,
+    resp.name = sn, dir.name = short_dir)
+  bm_mod <- biomod2::BIOMOD_Modeling(
+    bm.format = bm_data, modeling.id = sn,
+    models = c("GLM", "GBM", "RF", "MAXNET"),
+    CV.strategy = "kfold", CV.k = 5, CV.nb.rep = 5, CV.do.full.models = FALSE,
+    var.import = 3, metric.eval = c("TSS", "AUCroc"), seed.val = 42)
+  bm_ens <- biomod2::BIOMOD_EnsembleModeling(
+    bm.mod = bm_mod, models.chosen = "all", em.by = "all",
+    metric.select = "TSS", metric.select.thresh = 0.4,
+    metric.eval = c("TSS", "AUCroc"), em.algo = "EMmean",
+    var.import = 3, seed.val = 42)
+  biomod2::BIOMOD_EnsembleForecasting(
+    bm.em = bm_ens, new.env = env_rast_masked,
+    proj.name = paste0(sn, "_current"), models.chosen = "all", on_0_1000 = TRUE)
+
+  sdm_results[[g]] <- list(
+    bm_mod = bm_mod, bm_ens = bm_ens,
+    eval = biomod2::get_evaluations(bm_mod),
+    vi   = biomod2::get_variables_importance(bm_mod),
+    short_name = sn, short_dir = short_dir)
+  saveRDS(sdm_results, "outputs/models/sdm_results_final.rds")
+}
+cat("Lineages modelled:", length(sdm_results), "of", length(sdm_groups), "\n")
+```
+
+#Future projections
+
+```{r}
+scenarios <- c("SSP245_2050", "SSP585_2050", "SSP245_2070", "SSP585_2070")
+short_map <- c(
+  "Rhizobium_cluster" = "Rhiz", "Bradyrhizobium_novel" = "Bnov",
+  "B. elkanii_cluster" = "Belk", "B. japonicum_cluster" = "Bjap",
+  "Bradyrhizobium_cluster" = "Bcl", "R. phaseoli_cluster" = "Rpha",
+  "R. leguminosarum_cluster" = "Rleg", "M. tropici_cluster" = "Mtrop",
+  "R. radiobacter_cluster" = "Rrad")
+
+roots <- c(file.path(getwd(), "outputs", "biomod2"), "C:/sdm_tmp")
+roots <- roots[dir.exists(roots)]
+
+# Locate the ensemble GeoTIFF of one biomod2 projection
+find_tif <- function(proj_name) {
+  f <- list.files(roots, pattern = "ensemble\\.tif$", recursive = TRUE, full.names = TRUE)
+  f <- f[grepl(paste0("/proj_", proj_name, "/"), f)]
+  if (length(f)) f[1] else NA_character_
+}
+# write the EMmean layer to outputs
+save_tif <- function(src, dest) {
+  r <- terra::rast(src)
+  if (terra::nlyr(r) > 1) {
+    em <- grep("EMmean", names(r), ignore.case = TRUE)
+    r <- if (length(em)) r[[em[1]]] else r[[1]]
+  }
+  terra::writeRaster(r, dest, overwrite = TRUE)
+}
+
+for (g in sdm_groups) {
+  g_clean <- gsub("[^A-Za-z0-9]", "_", g)
+  sn      <- short_map[[g]]
+  bm_ens  <- sdm_results[[g]]$bm_ens
+  if (is.null(bm_ens)) { cat("No ensemble for", g, "- skipped\n"); next }
+  cat("\n===", g, "(", sn, ") ===\n")
+
+  #Current climate
+  dest <- paste0("outputs/models/", g_clean, "_current.tif")
+  cur_names <- unique(c(paste0(g_clean, "_current"), paste0(sn, "_current")))
+  src <- NA_character_
+  for (pn in cur_names) if (is.na(src)) src <- find_tif(pn)
+  if (is.na(src)) {
+    env_cur <- terra::rast("data/processed/env_rast_masked.tif")
+    biomod2::BIOMOD_EnsembleForecasting(bm.em = bm_ens, new.env = env_cur,
+      proj.name = paste0(sn, "_current"), models.chosen = "all", on_0_1000 = TRUE)
+    src <- find_tif(paste0(sn, "_current"))
+  }
+  stopifnot("current projection not found" = !is.na(src))
+  save_tif(src, dest); cat("  current OK\n")
+
+# Future scenarios
+  for (sc in scenarios) {
+    dest <- paste0("outputs/models/", g_clean, "_", sc, ".tif")
+    if (file.exists(dest)) { cat("  ", sc, "exists, skipped\n"); next }
+    src <- find_tif(paste0(sn, "_", sc))
+    if (is.na(src)) {
+      fut_stack <- terra::rast(paste0("data/processed/future_", sc, ".tif"))
+      biomod2::BIOMOD_EnsembleForecasting(bm.em = bm_ens, new.env = fut_stack,
+        proj.name = paste0(sn, "_", sc), models.chosen = "all", on_0_1000 = TRUE)
+      src <- find_tif(paste0(sn, "_", sc))
+      rm(fut_stack); invisible(gc())
+    }
+    stopifnot("future projection not found" = !is.na(src))
+    save_tif(src, dest); cat("  ", sc, "OK\n")
+  }
+}
+
+# Check one resolution, values on the 0-1000 scale
+all_sc <- c("current", scenarios)
+chk <- do.call(rbind, lapply(sdm_groups, function(g) {
+  g_clean <- gsub("[^A-Za-z0-9]", "_", g)
+  do.call(rbind, lapply(all_sc, function(sc) {
+    fp <- paste0("outputs/models/", g_clean, "_", sc, ".tif")
+    if (!file.exists(fp)) return(data.frame(file = basename(fp), res = NA, max = NA))
+    r <- terra::rast(fp)
+    data.frame(file = basename(fp), res = round(terra::res(r)[1], 4),
+               max = as.numeric(terra::global(r, "max", na.rm = TRUE)[1, 1]))
+  }))
+}))
+print(chk, row.names = FALSE)
+stopifnot("missing rasters" = !anyNA(chk$res),
+          "resolution mismatch among rasters" = length(unique(chk$res)) == 1,
+          "values not on the 0-1000 scale" = all(chk$max > 0 & chk$max <= 1000))
+cat("\nAll", nrow(chk), "rasters present, one resolution (", unique(chk$res), "deg).\n")
+```
+
+#Performance metrics
+
+```{r}
+sdm_results <- readRDS("outputs/models/sdm_results_final.rds")
+sdm_groups <- readRDS("data/processed/sdm_groups.rds")
+
+# Pull evaluation scores from each biomod2 object
+ev_all <- purrr::map_dfr(sdm_groups, function(g){
+  bm <- sdm_results[[g]]$bm_mod
+  e <- biomod2::get_evaluations(bm)
+  e$Group <- g
+  e
+})
+
+cat("=== Columns available ===\n")
+print(names(ev_all))
+cat("\nMetrics present:\n")
+print(unique(ev_all$metric.eval))
+cat("\nAlgorithms:\n")
+print(unique(ev_all$algo))
+cat("\nRows:", nrow(ev_all), "\n")
+
+# Per cluster × algorithm × metric
+perf_algo <- ev_all |>
+  dplyr::filter(!is.na(validation)) |>
+  dplyr::group_by(Group, algo, metric.eval) |>
+  dplyr::summarise(
+    mean = round(mean(validation, na.rm=TRUE), 3),
+    sd   = round(sd(validation,   na.rm=TRUE), 3),
+    n    = dplyr::n(), .groups="drop") |>
+  dplyr::mutate(value = paste0(mean, " \u00b1 ", sd))
+
+wide_algo <- perf_algo |>
+  dplyr::select(Group, algo, metric.eval, value) |>
+  tidyr::pivot_wider(names_from=metric.eval,
+                     values_from=value)
+print(as.data.frame(wide_algo), row.names=FALSE)
+write.csv(wide_algo,"outputs/tables/performance_by_algo.csv",
+  row.names=FALSE)
+
+# Per lineage, pooled across algorithms
+perf_lin <- ev_all |>
+  dplyr::filter(!is.na(validation)) |>
+  dplyr::group_by(Group, metric.eval) |>
+  dplyr::summarise(
+    mean = round(mean(validation, na.rm=TRUE), 3),
+    sd   = round(sd(validation,   na.rm=TRUE), 3),
+    .groups="drop") |>
+  dplyr::mutate(value = paste0(mean, " \u00b1 ", sd)) |>
+  dplyr::select(Group, metric.eval, value) |>
+  tidyr::pivot_wider(names_from=metric.eval,
+                     values_from=value)
+
+# Same pseudo-absences across algorithms
+cat("=== Q1: PA consistency across algorithms ===\n")
+g <- "Rhizobium_cluster"
+bm_mod <- sdm_results[[g]]$bm_mod
+fd <- biomod2::get_formal_data(bm_mod)
+cat("Response table rows:",
+    length(fd@data.species),"\n")
+cat("Presences:", sum(fd@data.species==1,
+    na.rm=TRUE),"\n")
+cat("Background/PA:", sum(fd@data.species==0 |
+    is.na(fd@data.species)),"\n")
+preds <- biomod2::get_predictions(bm_mod)
+cat("Algorithms sharing this data:",
+    paste(unique(preds$algo), collapse=", "),"\n")
+cat("Same n points per algo:\n")
+print(preds |> dplyr::count(algo) |>
+  dplyr::mutate(per_run=n/
+    dplyr::n_distinct(preds$run)))
+cat(">> All algos drew from the same",
+    "formatted presence-background table\n")
+
+# CBI on continuous current output
+cbi_tab <- purrr::map_dfr(sdm_groups, function(g){
+  g_c <- gsub("[^A-Za-z0-9]","_",g)
+  r <- terra::rast(paste0(
+    "outputs/models/",g_c,"_current.tif"))
+  pxy <- metadata |>
+    dplyr::filter(Groups==g) |>
+    dplyr::select(Longitude,Latitude)
+  pres_suit <- terra::extract(r,
+    as.matrix(pxy))[,1]
+  pres_suit <- pres_suit[!is.na(pres_suit)]
+  all_suit <- terra::values(r)
+  all_suit <- all_suit[!is.na(all_suit)]
+  b <- tryCatch(
+    ecospat::ecospat.boyce(
+      fit=all_suit, obs=pres_suit,
+      nclass=0, PEplot=FALSE)$cor,
+    error=function(e) NA)
+  data.frame(Group=g, n=length(pres_suit),
+    CBI=round(b,3))
+})
+print(as.data.frame(cbi_tab), row.names=FALSE)
+cat("\n(CBI: +1 = perfect, 0 = random,",
+    "<0 = worse than random)\n")
+write.csv(cbi_tab,"outputs/tables/CBI_continuous.csv",row.names=FALSE)
+
+perf_lin <- perf_lin |> dplyr::left_join(cbi_tab, by="Group")
+print(as.data.frame(perf_lin), row.names=FALSE)
+write.csv(perf_lin,"outputs/tables/performance_by_lineage.csv",row.names=FALSE)
+```
+
+#Variable importance and partial dependence plots (PDP)
+
+```{r}
+#Variable importance
+group_cols <- c(
+  "B. elkanii_cluster"="#E76F51",
+  "B. japonicum_cluster"="#F4A261",
+  "Bradyrhizobium_cluster"="#CCCCCC",
+  "Bradyrhizobium_novel"="#8B0000",
+  "M. tropici_cluster"="#90E0EF",
+  "R. leguminosarum_cluster"="#2A9D8F",
+  "R. phaseoli_cluster"="#264653",
+  "R. radiobacter_cluster"="#48CAE4",
+  "Rhizobium_cluster"="#888888")
+
+var_labels <- c(
+  BIO2_DiurnalRange="BIO2_DiurnalRange",
+  BIO4_TempSeason="BIO4_TempSeason",
+  BIO8_MeanTWetQ="BIO8_MeanTWetQ",
+  BIO14_PrecDryM="BIO14_PrecDryM",
+  BIO15_PrecSeason="BIO15_PrecSeason",
+  BIO16_PrecWetQ="BIO16_PrecWetQ",
+  BIO18_PrecWarmQ="BIO18_PrecWarmQ",
+  BIO19_PrecColdQ="BIO19_PrecColdQ",
+  Soil_pH="Soil pH",
+  Soil_N="Total N",
+  Soil_clay="Soil clay",
+  Soil_CEC="CEC")
+
+vi_all <- list()
+
+for (g in sdm_groups) {
+  g_clean <- gsub("[^A-Za-z0-9]","_",g)
+  cat("VI:", g, "\n")
+
+  vi_df <- sdm_results[[g]]$vi
+  if (is.null(vi_df)) {
+    cat("  No VI, skip\n"); next
+  }
+
+  vi_g <- vi_df |>
+    dplyr::group_by(expl.var) |>
+    dplyr::summarise(
+      mean_imp=round(mean(var.imp,na.rm=TRUE),4),
+      sd_imp=round(sd(var.imp,na.rm=TRUE),4),
+      .groups="drop") |>
+    dplyr::mutate(
+      sd_imp=tidyr::replace_na(sd_imp,0),
+      Group=g,
+      var_label=dplyr::recode(expl.var,
+        !!!var_labels, .default=expl.var),
+      var_label=forcats::fct_reorder(
+        var_label, mean_imp))
+
+  vi_all[[g]] <- vi_g
+
+  g_col <- group_cols[g]
+  if (is.na(g_col)) g_col <- "steelblue"
+  n_rec <- sum(metadata$Groups==g)
+
+ p_vi <- ggplot2::ggplot(vi_g, ggplot2::aes(x=var_label, y=mean_imp)) +
+  ggplot2::geom_bar(stat="identity", fill=g_col, colour="grey20",
+    width=0.7, linewidth=0.3) +
+  ggplot2::coord_flip() +
+  ggplot2::scale_y_continuous(
+    limits = c(0, max(vi_g$mean_imp, na.rm = TRUE) * 1.15),
+    expand = ggplot2::expansion(mult = c(0, 0.02))) +
+  ggplot2::labs(
+    title = paste0("Variable importance \u2014 ", gsub("_"," ",g)),
+    x = NULL, y = "Variable importance") +
+  ggplot2::theme_bw(base_size=12) +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(size=13, face="bold.italic", hjust=0.5),
+    axis.text.y = ggplot2::element_text(size=20, colour="black"),
+    axis.text.x = ggplot2::element_text(size=15, colour="black"),
+    panel.grid.major.y = ggplot2::element_blank(),
+    panel.grid.minor = ggplot2::element_blank(),
+    panel.border = ggplot2::element_rect(colour="black", fill=NA, linewidth=1),
+    plot.background = ggplot2::element_rect(fill="white", colour=NA))
+ 
+  ggplot2::ggsave(paste0("outputs/figures/Fig_VI_", g_clean,".png"),p_vi, width=9, height=7,dpi=300, bg="white")
+
+}
+
+#Partial dependence plots
+map_label <- function(x){
+  out <- var_labels[x]
+  out[is.na(out)] <- x[is.na(out)]
+  unname(out)
+}
+for (g in sdm_groups) {
+  g_clean <- gsub("[^A-Za-z0-9]","_",g)
+  cat("PDP:", g, "\n")
+  bm_mod <- sdm_results[[g]]$bm_mod
+  if (is.null(bm_mod)) next
+  top_vars <- vi_all[[g]] |>
+    dplyr::arrange(dplyr::desc(mean_imp)) |>
+    dplyr::slice(1:min(6,dplyr::n())) |>  
+    dplyr::pull(expl.var)
+  pdp_raw <- tryCatch(
+    biomod2::bm_PlotResponseCurves(
+      bm.out=bm_mod, models.chosen="all",
+      fixed.var="mean", do.plot=FALSE,
+      nb.pts=100),
+    error=function(e){
+      cat("  err:",e$message,"\n"); NULL})
+  if (is.null(pdp_raw)) next
+  pdp_df <- pdp_raw$tab |>
+    as.data.frame() |>
+    dplyr::filter(expl.name %in% top_vars) |>
+    dplyr::group_by(expl.name, expl.val) |>
+    dplyr::summarise(
+      mean_resp=mean(pred.val,na.rm=TRUE),
+      sd_resp=sd(pred.val,na.rm=TRUE),
+      .groups="drop") |>
+    dplyr::mutate(
+      sd_resp=tidyr::replace_na(sd_resp,0),
+      var_label=map_label(expl.name))
+  # Order facets by importance
+  lab_order <- map_label(top_vars)
+  pdp_df$var_label <- factor(
+    pdp_df$var_label,
+    levels=unique(lab_order))
+  if (nrow(pdp_df)==0) next
+  g_col <- group_cols[g]
+  if (is.na(g_col)) g_col <- "steelblue"
+  n_rec <- sum(metadata$Groups==g)
+  p_pdp <- ggplot2::ggplot(pdp_df,
+    ggplot2::aes(x=expl.val, y=mean_resp)) +
+    ggplot2::geom_ribbon(
+      ggplot2::aes(
+        ymin=pmax(0,mean_resp-sd_resp),
+        ymax=pmin(1,mean_resp+sd_resp)),
+      fill=g_col, alpha=0.25) +
+    ggplot2::geom_line(
+      colour=g_col, linewidth=1.1) +
+    ggplot2::scale_y_continuous(
+      limits=c(0,1),
+      breaks=c(0,.25,.5,.75,1),
+      labels=scales::percent_format()) +
+    ggplot2::facet_wrap(
+      ~var_label, scales="free_x", ncol=3, nrow=2) +
+    ggplot2::labs(
+      title=paste0(
+        "Partial dependence \u2014 ",
+        gsub("_"," ",g)),
+      subtitle="Six most important predictors (ranked by permutation importance)",
+      x="Variable value",
+      y="Habitat suitability") +
+    ggplot2::theme_bw(base_size=11) +
+    ggplot2::theme(
+      plot.title=ggplot2::element_text(
+        size=12,face="bold.italic",hjust=0.5),
+      plot.subtitle=ggplot2::element_text(
+        size=9,hjust=0.5,colour="grey40"),
+      strip.text=ggplot2::element_text(
+        size=20,face="bold"),
+      strip.background=ggplot2::element_rect(
+        fill="grey95"),
+      axis.text=ggplot2::element_text(
+        size=18,colour="black"),
+      panel.grid.minor=
+        ggplot2::element_blank(),
+      panel.border=ggplot2::element_rect(
+        colour="black",fill=NA,linewidth=1.5),
+      plot.background=ggplot2::element_rect(
+        fill="white",colour=NA))
+  ggplot2::ggsave(paste0("outputs/figures/Fig_PDP_",g_clean,".png"),p_pdp, width=13, height=9,dpi=300, bg="white")
+}
+```
+
+#Continuous maps projections for clusters
+
+```{r}
+#Current suitability maps
+sampled_v <- terra::vect(
+  sampled_mask_sf |> sf::st_make_valid() |>
+  sf::st_union() |> sf::st_make_valid())
+
+pretty_lab <- c(
+  "Bradyrhizobium_cluster"   = "Bradyrhizobium cluster",
+  "Bradyrhizobium_novel"     = "Bradyrhizobium novel",
+  "B. elkanii_cluster"       = "B. elkanii",
+  "B. japonicum_cluster"     = "B. japonicum",
+  "Rhizobium_cluster"        = "Rhizobium sp.",
+  "R. phaseoli_cluster"      = "R. phaseoli",
+  "R. leguminosarum_cluster" = "R. leguminosarum",
+  "R. radiobacter_cluster"   = "R. radiobacter",
+  "M. tropici_cluster"       = "Martinezella tropici")
+
+bb <- sf::st_bbox(sampled_mask_sf)
+xl <- c(bb["xmin"] - 1, bb["xmax"] + 1)
+yl <- c(bb["ymin"] - 1, bb["ymax"] + 1)
+
+outdir <- "outputs/maps"; dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+for (g in sdm_groups) {
+  g_c <- gsub("[^A-Za-z0-9]", "_", g)
+
+  r <- terra::rast(paste0("outputs/models/", g_c, "_current.tif"))
+  r <- terra::mask(r, sampled_v) / 10            # 0-1000 -> 0-100 %
+  d <- as.data.frame(r, xy = TRUE, na.rm = TRUE)
+  names(d)[3] <- "suit"
+
+  p <- ggplot2::ggplot() +
+    ggplot2::geom_sf(data = africa_outline, fill = "#EDEDED", colour = NA) +
+    ggplot2::geom_sf(data = sampled_mask_sf, fill = "#F7F7F7",
+                     colour = "grey60", linewidth = 0.3) +
+    ggplot2::geom_raster(data = d, ggplot2::aes(x, y, fill = suit)) +
+    ggplot2::geom_sf(data = sampled_mask_sf, fill = NA,
+                     colour = "black", linewidth = 0.35) +
+    ggplot2::scale_fill_viridis_c(
+      option = "magma", limits = c(0, 100), breaks = seq(0, 100, 25),
+      name = "Habitat\nsuitability (%)") +
+    ggplot2::coord_sf(xlim = xl, ylim = yl, expand = FALSE) +
+    ggplot2::labs(title = pretty_lab[[g]],
+                  subtitle = "Current (1970-2000)",
+                  x = NULL, y = NULL) +
+    ggplot2::theme_bw(base_size = 12) +
+    ggplot2::theme(
+      plot.title      = ggplot2::element_text(size = 13, hjust = 0.5),
+      plot.subtitle   = ggplot2::element_text(size = 10, hjust = 0.5,
+                                              colour = "grey40"),
+      panel.grid      = ggplot2::element_blank(),
+      panel.border    = ggplot2::element_rect(colour = "black", fill = NA,
+                                              linewidth = 0.7),
+      axis.text       = ggplot2::element_text(size = 13, colour = "black"),
+      legend.title    = ggplot2::element_text(size = 11, face = "bold"),
+      legend.text     = ggplot2::element_text(size = 10),
+      plot.background = ggplot2::element_rect(fill = "white", colour = NA)) +
+    ggspatial::annotation_scale(location = "bl", width_hint = 0.3,
+                                text_cex = 0.55,
+                                bar_cols = c("black", "white")) +
+    ggspatial::annotation_north_arrow(location = "tr", which_north = "true",
+                                      height = ggplot2::unit(0.8, "cm"),
+                                      width  = ggplot2::unit(0.6, "cm"),
+                                      style = ggspatial::north_arrow_fancy_orienteering())
+
+  ggsave(file.path(outdir,paste0("FigS_suit_", g_c, "_current.png"),p, width = 7, height = 7, dpi = 320, bg = "white"))
+  terra::tmpFiles(remove = TRUE)
+}
+
+#Future suitability maps
+scen_future <- c("SSP245_2050","SSP585_2050","SSP245_2070","SSP585_2070")
+scen_title  <- c(
+  SSP245_2050="SSP2-4.5 (2041-2060)", SSP585_2050="SSP5-8.5 (2041-2060)",
+  SSP245_2070="SSP2-4.5 (2061-2080)", SSP585_2070="SSP5-8.5 (2061-2080)")
+
+for (g in sdm_groups) {
+  g_c <- gsub("[^A-Za-z0-9]", "_", g)
+
+  for (sc in scen_future) {
+    fin <- paste0("outputs/models/", g_c, "_", sc, ".tif")
+    if (!file.exists(fin)) { cat("!! MISSING:", fin, "\n"); next }
+
+    r <- terra::mask(terra::rast(fin), sampled_v) / 10   # 0-1000 -> 0-100 %
+    d <- as.data.frame(r, xy = TRUE, na.rm = TRUE)
+    names(d)[3] <- "suit"
+
+    p <- ggplot2::ggplot() +
+      ggplot2::geom_sf(data = africa_outline, fill = "#EDEDED", colour = NA) +
+      ggplot2::geom_sf(data = sampled_mask_sf, fill = "#F7F7F7",
+                       colour = "grey60", linewidth = 0.3) +
+      ggplot2::geom_raster(data = d, ggplot2::aes(x, y, fill = suit)) +
+      ggplot2::geom_sf(data = sampled_mask_sf, fill = NA, colour = "black",
+                       linewidth = 0.35) +
+      ggplot2::scale_fill_viridis_c(
+        option = "magma", limits = c(0, 100), breaks = seq(0, 100, 25),
+        name = "Habitat\nsuitability (%)") +
+      ggplot2::coord_sf(xlim = xl, ylim = yl, expand = FALSE) +
+      ggplot2::labs(title = pretty_lab[[g]], subtitle = scen_title[[sc]],
+                    x = NULL, y = NULL) +
+      ggplot2::theme_bw(base_size = 12) +
+      ggplot2::theme(
+        plot.title      = ggplot2::element_text(size = 13, hjust = 0.5),
+        plot.subtitle   = ggplot2::element_text(size = 10, hjust = 0.5,
+                                                colour = "grey40"),
+        panel.grid      = ggplot2::element_blank(),
+        panel.border    = ggplot2::element_rect(colour = "black", fill = NA,
+                                                linewidth = 0.7),
+        axis.text       = ggplot2::element_text(size = 13, colour = "black"),
+        legend.title    = ggplot2::element_text(size = 11, face = "bold"),
+        legend.text     = ggplot2::element_text(size = 10),
+        plot.background = ggplot2::element_rect(fill = "white", colour = NA)) +
+      ggspatial::annotation_scale(location = "bl", width_hint = 0.3,
+                                  text_cex = 0.55, bar_cols = c("black","white")) +
+      ggspatial::annotation_north_arrow(location = "tr", which_north = "true",
+                                        height = ggplot2::unit(0.8,"cm"),
+                                        width  = ggplot2::unit(0.6,"cm"),
+                                        style = ggspatial::north_arrow_fancy_orienteering())
+
+    ggplot2::ggsave(file.path(outdir, paste0("Fig_suit_", g_c, "_", sc, ".png")),p, width = 7, height = 7, dpi = 320, bg = "white")
+    rm(r, d, p); gc()
+  }
+  terra::tmpFiles(remove = TRUE)
+  cat(g, "done\n")
+}
+```
+
+#Continuous maps projections for genus
+
+```{r}
+bb <- sf::st_bbox(sampled_mask_sf)
+xl <- c(-20, 52); yl <- c(-35, 38)
+cell_km2 <- terra::cellSize(
+  terra::rast("outputs/models/Rhizobium_cluster_current.tif"),
+  unit="km", mask=FALSE)
+a_all <- terra::values(cell_km2)[,1]; rm(cell_km2); gc()
+area_rows <- list()
+genus_members <- list(
+  Bradyrhizobium = c("Bradyrhizobium_cluster","Bradyrhizobium_novel",
+                     "B. elkanii_cluster","B. japonicum_cluster"),
+  Rhizobium      = c("Rhizobium_cluster","R. leguminosarum_cluster",
+                     "R. phaseoli_cluster","R. radiobacter_cluster"),
+  Martinezella   = c("M. tropici_cluster"))
+
+scen_all   <- c("current","SSP245_2050","SSP585_2050","SSP245_2070","SSP585_2070")
+scen_title <- c(current="Current (1970-2000)",
+  SSP245_2050="SSP2-4.5 (2041-2060)", SSP585_2050="SSP5-8.5 (2041-2060)",
+  SSP245_2070="SSP2-4.5 (2061-2080)", SSP585_2070="SSP5-8.5 (2061-2080)")
+
+for (gen in names(genus_members)) {
+  members <- genus_members[[gen]]
+  for (sc in scen_all) {
+    st <- NULL
+    for (m in members) {
+      m_c <- gsub("[^A-Za-z0-9]","_",m)
+      r <- terra::rast(paste0("outputs/models/",m_c,"_",sc,".tif"))
+      st <- if (is.null(st)) r else max(st, r, na.rm=TRUE); rm(r); gc()
+    }
+    st <- terra::mask(st/10, sampled_v)   # 0-1000 -> 0-100 %, 9-country domain
+    terra::writeRaster(st, file.path(sufdir, paste0(gen,"_",sc,"_suit.tif")),
+                       overwrite=TRUE, gdal=c("COMPRESS=LZW"))
+    sdf <- as.data.frame(st, xy=TRUE, na.rm=TRUE); names(sdf)[3] <- "suit"
+
+    p <- ggplot2::ggplot() +
+      ggplot2::geom_sf(data=africa_outline, fill="#EDEDED", colour=NA) +
+      ggplot2::geom_sf(data=sampled_mask_sf, fill="#F7F7F7",
+                       colour="grey60", linewidth=0.3) +
+      ggplot2::geom_raster(data=sdf, ggplot2::aes(x,y,fill=suit)) +
+      ggplot2::geom_sf(data=sampled_mask_sf, fill=NA, colour="black",
+                       linewidth=0.35) +
+      ggplot2::scale_fill_viridis_c(option="magma", limits=c(0,100),
+        breaks=seq(0,100,25), name="Habitat\nsuitability (%)") +
+      ggplot2::coord_sf(xlim=xl, ylim=yl, expand=FALSE) +
+      ggplot2::labs(title=paste0(gen," \u2014 ",scen_title[sc]), x=NULL, y=NULL) +
+      ggplot2::theme_bw(base_size=12) +
+      ggplot2::theme(
+        plot.title=ggplot2::element_text(size=13,face="bold.italic",hjust=0.5),
+        panel.grid=ggplot2::element_blank(),
+        panel.border=ggplot2::element_rect(colour="black",fill=NA,linewidth=1),
+        axis.text=ggplot2::element_text(size=13,colour="black"),
+        legend.title=ggplot2::element_text(size=15,face="bold"),
+        legend.text=ggplot2::element_text(size=13),
+        plot.background=ggplot2::element_rect(fill="white",colour=NA)) +
+      ggspatial::annotation_scale(location="bl", width_hint=0.3, text_cex=0.55,
+                                  bar_cols=c("black","white")) +
+      ggspatial::annotation_north_arrow(location="tr", which_north="true",
+        height=ggplot2::unit(0.8,"cm"), width=ggplot2::unit(0.6,"cm"),
+        style=ggspatial::north_arrow_fancy_orienteering())
+
+    ggsave(paste0("outputs/maps/Fig_genus_suit_",gen,"_",sc,".png"), p, width=7, height=7, dpi=320, bg="white")
+  }
+}
+```
+
+#Thresholding of continuous suitability in core and margin zones
+
+```{r}
+#Extract TSS-optimal thresholds (models)
+tss_thresh <- purrr::map_dfr(
+  sdm_groups, function(g){
+    e <- sdm_results[[g]]$eval
+    if (is.null(e)) return(NULL)
+    cutoff <- e |>
+      dplyr::filter(metric.eval=="TSS",
+        !is.na(cutoff)) |>
+      dplyr::pull(cutoff) |>
+      mean(na.rm=TRUE)
+    data.frame(
+      Group=g,
+      TSS_cutoff=round(cutoff,1))
+  })
+saveRDS(tss_thresh,"data/processed/tss_thresh.rds")
+
+ref <- terra::rast(
+  "outputs/models/Rhizobium_cluster_current.tif")
+a_all <- terra::values(terra::cellSize(ref, unit = "km", mask = FALSE))[, 1]   # latitude-correct cell area (km2)
+sampled_v <- terra::vect(
+  sampled_mask_sf |> sf::st_make_valid() |>
+  sf::st_union() |> sf::st_make_valid())
+
+cmp <- purrr::map_dfr(sdm_groups, function(g){
+  g_c <- gsub("[^A-Za-z0-9]","_",g)
+
+  cur <- terra::mask(terra::rast(paste0(
+    "outputs/models/",g_c,"_current.tif")),
+    sampled_v)
+  vals_all <- terra::values(cur)[, 1]; ok_v <- !is.na(vals_all)
+  vals <- vals_all[ok_v]; a_ok <- a_all[ok_v]
+
+  # Suitability AT occurrence points
+  pres_xy <- metadata |>
+    dplyr::filter(Groups==g) |>
+    dplyr::select(Longitude, Latitude)
+  pres_suit <- terra::extract(
+    terra::rast(paste0(
+      "outputs/models/",g_c,"_current.tif")),
+    as.matrix(pres_xy))[,1]
+  pres_suit <- pres_suit[!is.na(pres_suit)]
+
+  #Method 1: TSS-max
+  thr_tss <- tss_thresh |>
+    dplyr::filter(Group==g) |> dplyr::pull(TSS_cutoff)
+
+  # Method 2: maxSSS threshold maximising sensitivity+specificity,computed from biomod2 eval cutoffs (TSS uses same criterion); approximate via presence vs background
+  bg <- readRDS("data/processed/background_final.rds")
+  bg_suit <- terra::extract(
+    terra::rast(paste0(
+      "outputs/models/",g_c,"_current.tif")),
+    as.matrix(bg$coords))[,1]
+  bg_suit <- bg_suit[!is.na(bg_suit)]
+  thr_seq <- seq(1, 999, by=2)
+  ss <- sapply(thr_seq, function(th){
+    sens <- mean(pres_suit >= th)
+    spec <- mean(bg_suit  <  th)
+    sens + spec
+  })
+  thr_maxsss <- thr_seq[which.max(ss)]
+
+  # Method 3: 10th percentile training presence
+  thr_p10 <- as.numeric(
+    quantile(pres_suit, 0.10, na.rm=TRUE))
+
+  # Method 4: fixed 0.3 (300)
+  thr_fix <- 300
+
+  # Areas for each
+  area_of <- function(th)
+    sum(a_ok[vals >= th])
+  pct_pres_excl <- function(th)
+    round(mean(pres_suit < th)*100,1)
+
+  data.frame(
+    Group=g, n=length(pres_suit),
+    pres_median=round(median(pres_suit),0),
+    pres_p10=round(thr_p10,0),
+    # TSS
+    TSS_thr=round(thr_tss,0),
+    TSS_km2=round(area_of(thr_tss),0),
+    TSS_presExcl=pct_pres_excl(thr_tss),
+    # maxSSS
+    maxSSS_thr=thr_maxsss,
+    maxSSS_km2=round(area_of(thr_maxsss),0),
+    maxSSS_presExcl=pct_pres_excl(thr_maxsss),
+    # p10
+    p10_thr=round(thr_p10,0),
+    p10_km2=round(area_of(thr_p10),0),
+    p10_presExcl=pct_pres_excl(thr_p10),
+    # fixed 0.3
+    fix_thr=thr_fix,
+    fix_km2=round(area_of(thr_fix),0),
+    fix_presExcl=pct_pres_excl(thr_fix))
+})
+
+cat("=== Threshold values (/1000) ===\n")
+print(cmp[,c("Group","n","pres_median",
+  "TSS_thr","maxSSS_thr","p10_thr","fix_thr")],
+  row.names=FALSE)
+
+cat("\n=== Current suitable area (km2) ===\n")
+print(cmp[,c("Group","TSS_km2","maxSSS_km2",
+  "p10_km2","fix_km2")], row.names=FALSE)
+
+cat("\n=== % of occurrences EXCLUDED by threshold ===\n")
+cat("(low = threshold captures most known sites)\n")
+print(cmp[,c("Group","TSS_presExcl",
+  "maxSSS_presExcl","p10_presExcl",
+  "fix_presExcl")], row.names=FALSE)
+
+write.csv(cmp,"outputs/tables/threshold_comparison.csv",row.names=FALSE)
+
+#Method 5:DSS, MCC, F-measure vs p10
+thr_seq <- seq(1, 999, by=2)
+
+cmp <- purrr::map_dfr(sdm_groups, function(g){
+  g_c <- gsub("[^A-Za-z0-9]","_",g)
+  rfull <- terra::rast(paste0(
+    "outputs/models/",g_c,"_current.tif"))
+  cur <- terra::mask(rfull, sampled_v)
+  vals_all <- terra::values(cur)[, 1]; ok_v <- !is.na(vals_all)
+  vals <- vals_all[ok_v]; a_ok <- a_all[ok_v]
+
+  pres_xy <- metadata |>
+    dplyr::filter(Groups==g) |>
+    dplyr::select(Longitude, Latitude)
+  P <- terra::extract(rfull,
+    as.matrix(pres_xy))[,1]; P <- P[!is.na(P)]
+  B <- terra::extract(rfull,
+    as.matrix(bg$coords))[,1]; B <- B[!is.na(B)]
+
+  met <- sapply(thr_seq, function(th){
+    # cast to double immediately
+    TP <- as.double(sum(P>=th))
+    FN <- as.double(sum(P<th))
+    FP <- as.double(sum(B>=th))
+    TN <- as.double(sum(B<th))
+    sens <- TP/(TP+FN)
+    spec <- TN/(TN+FP)
+    prec <- if((TP+FP)>0) TP/(TP+FP) else 0
+    F1 <- if((prec+sens)>0)
+      2*prec*sens/(prec+sens) else 0
+    mcc_den <- sqrt(
+      (TP+FP)*(TP+FN)*(TN+FP)*(TN+FN))  # now double
+    mcc <- if(mcc_den>0)
+      (TP*TN-FP*FN)/mcc_den else 0
+    c(sens=sens, spec=spec,
+      tss=sens+spec-1,
+      dss=abs(sens-spec),
+      mcc=mcc, f=F1)
+  })
+  met <- t(met)
+
+  thr_dss <- thr_seq[which.min(met[,"dss"])]
+  thr_mcc <- thr_seq[which.max(met[,"mcc"])]
+  thr_f   <- thr_seq[which.max(met[,"f"])]
+  thr_p10 <- as.numeric(quantile(P,0.10))
+
+  area_of <- function(th) sum(a_ok[vals>=th])
+  excl    <- function(th) round(mean(P<th)*100,1)
+
+  data.frame(
+    Group=g, n=length(P),
+    DSS_thr=thr_dss, DSS_km2=round(area_of(thr_dss),0),
+      DSS_excl=excl(thr_dss),
+    MCC_thr=thr_mcc, MCC_km2=round(area_of(thr_mcc),0),
+      MCC_excl=excl(thr_mcc),
+    F_thr=thr_f, F_km2=round(area_of(thr_f),0),
+      F_excl=excl(thr_f),
+    p10_thr=round(thr_p10,0),
+      p10_km2=round(area_of(thr_p10),0),
+      p10_excl=excl(thr_p10))
+})
+
+cat("=== Threshold values (/1000) ===\n")
+print(cmp[,c("Group","n","DSS_thr","MCC_thr",
+  "F_thr","p10_thr")], row.names=FALSE)
+cat("\n=== Current area (km2) ===\n")
+print(cmp[,c("Group","DSS_km2","MCC_km2",
+  "F_km2","p10_km2")], row.names=FALSE)
+cat("\n=== % occurrences excluded ===\n")
+print(cmp[,c("Group","DSS_excl","MCC_excl",
+  "F_excl","p10_excl")], row.names=FALSE)
+
+write.csv(cmp,"outputs/tables/threshold_comparison2.csv",row.names=FALSE)
+```
+
+#DSS and TSS frozen thresholds from baseline
+
+```{r}
+ref <- terra::rast("outputs/models/Rhizobium_cluster_current.tif")
+
+sampled_v <- terra::vect(
+  sampled_mask_sf |> sf::st_make_valid() |>
+  sf::st_union() |> sf::st_make_valid())
+
+# per-cell area in km², as a plain vector aligned to ref's grid
+cell_km2 <- terra::cellSize(ref, unit = "km", mask = FALSE)
+a_all    <- terra::values(cell_km2)[, 1]
+rm(cell_km2); invisible(gc())
+
+thr_seq <- seq(1, 999, by = 2)
+ssps    <- c("SSP245_2050", "SSP585_2050", "SSP245_2070", "SSP585_2070")
+
+# Freeze DSS + TSS per lineage (baseline only)
+thresholds <- purrr::map_dfr(sdm_groups, function(g) {
+  g_c   <- gsub("[^A-Za-z0-9]", "_", g)
+  rfull <- terra::rast(paste0("outputs/models/", g_c, "_current.tif"))
+
+  pxy <- metadata |> dplyr::filter(Groups == g) |>
+    dplyr::select(Longitude, Latitude)
+  P <- terra::extract(rfull, as.matrix(pxy))[, 1]; P <- P[!is.na(P)]
+  B <- terra::extract(rfull, as.matrix(bg$coords))[, 1]; B <- B[!is.na(B)]
+
+  th_tss <- tss_thresh |> dplyr::filter(Group == g) |> dplyr::pull(TSS_cutoff)
+  dss    <- sapply(thr_seq, function(t) abs(mean(P >= t) - mean(B < t)))
+  th_dss <- thr_seq[which.min(dss)]
+
+  data.frame(Group = g,
+             DSS = round(th_dss, 1), TSS = round(th_tss, 1),
+             margin_floor = min(th_dss, th_tss),
+             core_bound   = max(th_dss, th_tss))
+})
+saveRDS(thresholds, "data/processed/coremargin_thresholds.rds")
+
+# ΔCore% and ΔMargin% (frozen thresholds)
+cm <- purrr::map_dfr(sdm_groups, function(g) {
+  g_c <- gsub("[^A-Za-z0-9]", "_", g)
+  th  <- thresholds |> dplyr::filter(Group == g)
+  lo  <- th$margin_floor; hi <- th$core_bound
+
+  cur <- terra::mask(terra::rast(paste0(
+    "outputs/models/", g_c, "_current.tif")), sampled_v)
+  vc  <- terra::values(cur)[, 1]
+  okc <- !is.na(vc)
+  core_c <- sum(a_all[okc & vc >= hi])
+  marg_c <- sum(a_all[okc & vc >= lo & vc < hi])
+  rm(cur, vc, okc); invisible(gc())
+
+  out <- purrr::map_dfr(ssps, function(sc) {
+    fut <- terra::mask(terra::rast(paste0(
+      "outputs/models/", g_c, "_", sc, ".tif")), sampled_v)
+    vf  <- terra::values(fut)[, 1]
+    okf <- !is.na(vf)
+    core_f <- sum(a_all[okf & vf >= hi])
+    marg_f <- sum(a_all[okf & vf >= lo & vf < hi])
+    rm(fut, vf, okf); invisible(gc())
+
+    dcore <- (core_f - core_c) / max(core_c, 1) * 100
+    dmarg <- (marg_f - marg_c) / max(marg_c, 1) * 100
+
+    data.frame(Group=g, Scenario=sc,
+      margin_floor=lo, core_bound=hi,
+      Core_cur=round(core_c,0), Core_fut=round(core_f,0),
+      Core_pct=round(dcore,1),
+      Margin_cur=round(marg_c,0), Margin_fut=round(marg_f,0),
+      Margin_pct=round(dmarg,1))
+  })
+  terra::tmpFiles(remove = TRUE)
+  cat("  done:", g, "\n")
+  out
+})
+write.csv(cm, "outputs/tables/Table_core_margin_DSS_TSS.csv", row.names = FALSE)
+
+```
+
+#Core and margin projections for clusters
+
+```{r}
+zone_cols <- c("Core"="#B2182B","Margin"="#FDAE61")
+pretty_lab <- c(
+  "Bradyrhizobium_cluster"   = "Bradyrhizobium cluster",
+  "Bradyrhizobium_novel"     = "Bradyrhizobium novel",
+  "B. elkanii_cluster"       = "B. elkanii",
+  "B. japonicum_cluster"     = "B. japonicum",
+  "Rhizobium_cluster"        = "Rhizobium sp.",
+  "R. phaseoli_cluster"      = "R. phaseoli",
+  "R. leguminosarum_cluster" = "R. leguminosarum",
+  "R. radiobacter_cluster"   = "R. radiobacter",
+  "M. tropici_cluster"       = "Martinezella tropici")
+
+scen_all   <- c("current", "SSP245_2050","SSP585_2050","SSP245_2070","SSP585_2070")
+scen_title <- c(current="Current (1970-2000)", SSP245_2050="SSP2-4.5 (2041-2060)", SSP585_2050="SSP5-8.5 (2041-2060)",
+  SSP245_2070="SSP2-4.5 (2061-2080)", SSP585_2070="SSP5-8.5 (2061-2080)")
+bb <- sf::st_bbox(sampled_mask_sf)
+xl <- c(bb["xmin"] - 1, bb["xmax"] + 1)
+yl <- c(bb["ymin"] - 1, bb["ymax"] + 1)
+
+for (g in sdm_groups) {
+  g_c <- gsub("[^A-Za-z0-9]","_",g)
+  th  <- thresholds |> dplyr::filter(Group==g)
+  lo  <- th$margin_floor; hi <- th$core_bound
+
+  for (sc in scen_all) {
+    r  <- terra::rast(paste0("outputs/models/",g_c,"_",sc,".tif"))
+    r  <- terra::mask(r, sampled_v)                         
+    zr <- terra::classify(r,
+      rbind(c(-Inf,lo,NA), c(lo,hi,2), c(hi,Inf,3)),
+      right=FALSE)                                          
+
+    zdf <- as.data.frame(zr, xy=TRUE, na.rm=TRUE)
+    names(zdf)[3] <- "z"
+    zdf$zone <- factor(dplyr::recode(zdf$z,`2`="Margin",`3`="Core"),
+      levels=c("Core","Margin"))
+    zdf <- zdf |> dplyr::filter(!is.na(zone))
+
+    p <- ggplot2::ggplot() +
+      ggplot2::geom_sf(data=africa_outline, fill="#EDEDED", colour=NA) +
+      ggplot2::geom_sf(data=sampled_mask_sf, fill="#F0F0F0",
+        colour="grey55", linewidth=0.35) +
+      ggplot2::geom_tile(data=zdf, ggplot2::aes(x,y,fill=zone)) +
+      ggplot2::geom_sf(data=sampled_mask_sf, fill=NA,
+        colour="black", linewidth=0.35) +
+      ggplot2::scale_fill_manual(values=zone_cols,
+        breaks=c("Core","Margin"), name="Habitat zone",
+        guide=ggplot2::guide_legend(override.aes=list(size=4))) +
+      ggplot2::coord_sf(xlim=c(-20,52), ylim=c(-35,38), expand=FALSE) +
+      ggplot2::labs(title=paste0(gsub("_"," ",g)," \u2014 ",scen_title[sc]),
+        subtitle=paste0("Core (\u2265",round(hi),") / Margin (",
+          round(lo),"-",round(hi),") | frozen DSS-TSS thresholds"),
+        x=NULL, y=NULL) +
+      ggplot2::theme_bw(base_size=12) +
+      ggplot2::theme(
+        plot.title=ggplot2::element_text(size=13,face="bold.italic",hjust=0.5),
+        plot.subtitle=ggplot2::element_text(size=10,hjust=0.5,colour="grey40"),
+        panel.grid=ggplot2::element_blank(),
+        panel.border=ggplot2::element_rect(colour="black",fill=NA,linewidth=0.7),
+        axis.text=ggplot2::element_text(size=13,colour="black"),
+        legend.title=ggplot2::element_text(size=15,face="bold"),
+        legend.text=ggplot2::element_text(size=13),
+        plot.background=ggplot2::element_rect(fill="white",colour=NA)) +
+      ggspatial::annotation_scale(location="bl", width_hint=0.3,
+        text_cex=0.55, bar_cols=c("black","white")) +
+      ggspatial::annotation_north_arrow(location="tr", which_north="true",
+        height=ggplot2::unit(0.8,"cm"), width=ggplot2::unit(0.6,"cm"),
+        style=ggspatial::north_arrow_fancy_orienteering())
+
+ggsave(paste0("outputs/maps/FigS_cm_",g_c,"_",sc,".png"),p, width=7, height=7, dpi=320, bg="white")
+  }
+  terra::tmpFiles(remove=TRUE)
+}
+```
+
+#Core and margin projections for genus
+
+```{r}
+zone_cols <- c("Core"="#B2182B","Margin"="#FDAE61")
+bb <- sf::st_bbox(sampled_mask_sf)
+xl <- c(-20, 52); yl <- c(-35, 38)
+cell_km2 <- terra::cellSize(
+  terra::rast("outputs/models/Rhizobium_cluster_current.tif"),
+  unit="km", mask=FALSE)
+a_all <- terra::values(cell_km2)[,1]; rm(cell_km2); gc()
+
+area_rows <- list()
+
+#core/margin, union of member lineages, per genus × scenario
+for (gen in names(genus_members)) {
+  members <- genus_members[[gen]]
+  for (sc in scen_all) {
+    core_u <- NULL; marg_u <- NULL
+    for (m in members) {
+      m_c <- gsub("[^A-Za-z0-9]","_",m)
+      th  <- thresholds |> dplyr::filter(Group==m)
+      lo  <- th$margin_floor; hi <- th$core_bound
+      r   <- terra::rast(paste0("outputs/models/",m_c,"_",sc,".tif"))
+      cm_ <- r >= hi; mm_ <- (r >= lo) & (r < hi)   
+      core_u <- if(is.null(core_u)) cm_ else max(core_u,cm_,na.rm=TRUE)
+      marg_u <- if(is.null(marg_u)) mm_ else max(marg_u,mm_,na.rm=TRUE)
+      rm(r,cm_,mm_); gc()
+    }
+    zr <- terra::mask(terra::ifel(core_u==1, 3, terra::ifel(marg_u==1, 2, NA)),
+                      sampled_v)
+
+    zv <- terra::values(zr)[,1]; ok <- !is.na(zv)
+    area_rows[[paste(gen,sc)]] <- data.frame(Genus=gen, Scenario=sc,
+      Core_km2   = round(sum(a_all[ok & zv==3]),0),
+      Margin_km2 = round(sum(a_all[ok & zv==2]),0))
+
+    zdf <- as.data.frame(zr, xy=TRUE, na.rm=TRUE); names(zdf)[3] <- "z"
+    zdf$zone <- factor(dplyr::recode(zdf$z, `2`="Margin", `3`="Core"),
+                       levels=c("Core","Margin"))
+    zdf <- zdf |> dplyr::filter(!is.na(zone))
+
+    p <- ggplot2::ggplot() +
+      ggplot2::geom_sf(data=africa_outline, fill="#EDEDED", colour=NA) +
+      ggplot2::geom_sf(data=sampled_mask_sf, fill="#F7F7F7",
+                       colour="grey55", linewidth=0.3) +
+      ggplot2::geom_tile(data=zdf, ggplot2::aes(x,y,fill=zone)) +
+      ggplot2::geom_sf(data=sampled_mask_sf, fill=NA, colour="black",
+                       linewidth=0.35) +
+      ggplot2::scale_fill_manual(values=zone_cols, breaks=c("Core","Margin"),
+        name="Habitat zone",
+        guide=ggplot2::guide_legend(override.aes=list(size=4))) +
+      ggplot2::coord_sf(xlim=xl, ylim=yl, expand=FALSE) +
+      ggplot2::labs(title=paste0(gen," \u2014 ",scen_title[sc]),
+        subtitle="Core/margin: union of member lineages",
+        x=NULL, y=NULL) +
+      ggplot2::theme_bw(base_size=12) +
+      ggplot2::theme(
+        plot.title=ggplot2::element_text(size=13,face="bold.italic",hjust=0.5),
+        plot.subtitle=ggplot2::element_text(size=10,hjust=0.5,colour="grey40"),
+        panel.grid=ggplot2::element_blank(),
+        panel.border=ggplot2::element_rect(colour="black",fill=NA,linewidth=0.6),
+        axis.text=ggplot2::element_text(size=13,colour="black"),
+        legend.title=ggplot2::element_text(size=15,face="bold"),
+        legend.text=ggplot2::element_text(size=13),
+        plot.background=ggplot2::element_rect(fill="white",colour=NA)) +
+      ggspatial::annotation_scale(location="bl", width_hint=0.3, text_cex=0.55,
+                                  bar_cols=c("black","white")) +
+      ggspatial::annotation_north_arrow(location="tr", which_north="true",
+        height=ggplot2::unit(0.8,"cm"), width=ggplot2::unit(0.6,"cm"),
+        style=ggspatial::north_arrow_fancy_orienteering())
+
+    ggsave(paste0("outputs/maps/Fig_cm_genus_",gen,"_",sc,".png"), p, width=7, height=7, dpi=320, bg="white")
+  }
+  terra::tmpFiles(remove=TRUE); cat("  core/margin:", gen, "done\n")
+}
+#Table genus core margin
+genus_areas <- do.call(rbind, area_rows); rownames(genus_areas) <- NULL
+write.csv(genus_areas, "outputs/tables/Table_genus_areas.csv",
+          row.names=FALSE)
+cat("\n=== Genus areas (km²) ===\n")
+print(genus_areas, row.names=FALSE)
+cat("\nAll genus maps done.\n")
+```
+
+#core and margin delta areas table
+
+```{r}
+ref <- terra::rast("outputs/models/Rhizobium_cluster_current.tif")
+cell_km2 <- terra::cellSize(ref, unit = "km", mask = FALSE)   
+
+country_lookup <- c(
+  "Ang"="Angola","Esw"="Kingdom of eSwatini",
+  "Eth"="Ethiopia","Gha"="Ghana","Ken"="Kenya",
+  "Moz"="Mozambique","Nam"="Namibia",
+  "SA"="South Africa","Sen"="Senegal")
+ssps <- c("SSP245_2050","SSP585_2050","SSP245_2070","SSP585_2070")
+
+#Core & margin area within a mask vector
+zone_areas <- function(r, mv, lo, hi, area_r){                 
+  r_m <- terra::mask(r, mv)
+  a_m <- terra::mask(area_r, mv)
+  v <- terra::values(r_m)[,1]; a <- terra::values(a_m)[,1]
+  ok <- !is.na(v)
+  c(core   = sum(a[ok][v[ok] >= hi]),
+    margin = sum(a[ok][v[ok] >= lo & v[ok] < hi]))
+}
+
+core_country <- purrr::map_dfr(sdm_groups, function(g){
+  g_c <- gsub("[^A-Za-z0-9]","_",g)
+  th <- thresholds |> dplyr::filter(Group==g)
+  lo <- th$margin_floor; hi <- th$core_bound
+  cur <- terra::rast(paste0("outputs/models/",g_c,"_current.tif"))
+
+  purrr::map_dfr(names(country_lookup), function(cc){
+    csf <- sampled_mask_sf |>
+      dplyr::filter(name_long==country_lookup[cc] | name==country_lookup[cc])
+    if (nrow(csf)==0) return(NULL)
+    cv <- terra::vect(csf |> sf::st_make_valid() |>
+      sf::st_union() |> sf::st_make_valid())
+    ac <- zone_areas(cur, cv, lo, hi, cell_km2)
+
+    purrr::map_dfr(ssps, function(sc){
+      fut <- terra::rast(paste0("outputs/models/",g_c,"_",sc,".tif"))
+      af <- zone_areas(fut, cv, lo, hi, cell_km2)
+
+      core_delta <- af["core"] - ac["core"]                    
+      marg_delta <- af["margin"] - ac["margin"]
+      core_pct <- if (ac["core"]   == 0) NA_real_ else round(core_delta/ac["core"]*100, 1)   
+      marg_pct <- if (ac["margin"] == 0) NA_real_ else round(marg_delta/ac["margin"]*100, 1)  
+
+      data.frame(Lineage=g, Country=country_lookup[cc],
+        Core_cur=round(ac["core"],0), Core_fut=round(af["core"],0),
+        Core_delta_km2=round(core_delta,0),                    
+        Core_change_pct=core_pct,
+        Margin_cur=round(ac["margin"],0), Margin_fut=round(af["margin"],0),
+        Margin_delta_km2=round(marg_delta,0),                 
+        Margin_change_pct=marg_pct)
+    })
+  })
+})
+
+write.csv(core_country,"outputs/tables/coremargin_by_country.csv", row.names=FALSE)
+```
+

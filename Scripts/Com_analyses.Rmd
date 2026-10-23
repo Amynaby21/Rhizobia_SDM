@@ -165,7 +165,7 @@ country_full <- c(
   "Nam"="Nam","SA"="SA",
   "Sen"="Sen")
 
-comp_ctry <- metadata_v3 |>
+comp_ctry <- metadata |>
   dplyr::filter(!is.na(Country)) |>
   dplyr::count(Country, Groups) |>
   dplyr::group_by(Country) |>
@@ -241,7 +241,7 @@ p_host <- ggplot2::ggplot(scores_df, ggplot2::aes(NMDS1, NMDS2, colour = Host)) 
   nmds_theme2
 
 p_host
-ggplot2::ggsave("outputs_v3/figures/Fig_NMDS_host.png", p_host, width=7, height=6, dpi=320, bg="white")
+ggplot2::ggsave("outputs/figures/Fig_NMDS_host.png", p_host, width=7, height=6, dpi=320, bg="white")
 
 country_cols <- c(
   Ang = "#F08080", Esw = "#D4A017", Eth = "#9ACD32", Gha = "#2E8B57",
@@ -514,7 +514,7 @@ saveRDS(list(web=web, H2=h2, p=p_val, d_lineage=sl_df, d_host=sl_h_df), "outputs
 write.csv(sl_df, "outputs/tables/d_prime_lineage.csv", row.names=FALSE)
 
 #-----------------Plot------------------------------------
-ns <- readRDS("outputs_v3/network_specialization.rds")
+ns <- readRDS("outputs/network_specialization.rds")
 web <- ns$web
 
 host_names <- c(Ar_hy="Ar_hy", Gl_ma="Gl_ma",
